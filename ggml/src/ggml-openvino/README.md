@@ -42,3 +42,18 @@ A missing or incompatible graph fails with an error instead of compiling with ab
 - File identity, size, modification/change timestamps, tensor offsets, graph structure, settings, and OpenVINO version identify cache entries. Linux uses device/inode and Windows uses volume serial/file index. Replacing, copying, or modifying a GGUF invalidates its entries. This avoids reading weight bytes and ties the cache to the local source files. Keep those files unchanged throughout loading and inference.
 - Use the same target device and compatible OpenVINO/plugin installation. Import support depends on the plugin; the tested CPU plugin cannot import MoE graphs containing `GatherMatmulCompressed`. GPU MoE and CPU dense graph imports were tested.
 - Blobs contain weights and can approach model size for each compiled graph. Import still reads those blobs and initializes the device.
+
+# NPU weightless weights bank
+
+On NPU, `GGML_OPENVINO_NPU_WEIGHTLESS_BANK=1` (with `GGML_OPENVINO_COMPILED_MODEL_CACHE_DIR`) caches the static prefill and decode graphs as weightless blobs plus one shared `<prefill>-<decode>.weights.bin`. Each distinct weight is stored once in that file, and both blobs reference it by offset. On a warm run both blobs are imported against the file, with no requantization, graph conversion or compilation, and NPUW keeps a single resident copy of the weights for both graphs. It needs no OpenVINO patch, unlike `GGML_OPENVINO_SELF_CONTAINED_BLOB` with `GGML_OPENVINO_NPU_SHARED_BANK`, which embeds the full weights in each blob.
+
+```sh
+# export (first run)
+GGML_OPENVINO_DEVICE=NPU GGML_OPENVINO_NPU_WEIGHTLESS_BANK=1 \
+GGML_OPENVINO_COMPILED_MODEL_CACHE_DIR=/path/to/npu-cache ./build/ReleaseOV/bin/llama-cli -m model.gguf
+# import (later runs); SELF_CONTAINED_MMAP also skips the private model buffer and fails if the cache is missing
+GGML_OPENVINO_DEVICE=NPU GGML_OPENVINO_NPU_WEIGHTLESS_BANK=1 GGML_OPENVINO_SELF_CONTAINED_MMAP=1 \
+GGML_OPENVINO_COMPILED_MODEL_CACHE_DIR=/path/to/npu-cache ./build/ReleaseOV/bin/llama-cli -m model.gguf
+```
+
+Keep all other settings identical between the export and import runs; they are part of the cache key. If either blob or the weights file is missing or incomplete, the pair is recompiled and all three files are rewritten.

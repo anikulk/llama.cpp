@@ -1815,7 +1815,10 @@ enum ggml_status ov_graph_compute_static(ggml_cgraph * cgraph, const std::shared
 
             const std::string model_cache_dir = ggml_openvino_model_cache_dir();
             const bool self_contained = device == "NPU" && !model_cache_dir.empty() &&
-                                        ggml_openvino_getenv_int("GGML_OPENVINO_SELF_CONTAINED_BLOB") != 0;
+                                        ggml_openvino_npu_raw_weight_cache_enabled();
+            // Weightless prefill/decode blobs plus one shared weights file. Needs NPUW, which cacheless graphs
+            // compile without, so those keep the embedded-weight blob.
+            const bool weightless_bank = self_contained && !no_kv_cache && ggml_openvino_npu_weightless_bank_enabled();
             ov::AnyMap mc_config = prefill_config;
             ov::AnyMap mc_decode_config = decode_config;
             if (!model_cache_dir.empty()) {
@@ -1829,7 +1832,7 @@ enum ggml_status ov_graph_compute_static(ggml_cgraph * cgraph, const std::shared
             uint64_t decode_fp = 0;
             if (!model_cache_dir.empty()) {
                 uint64_t base_extra = ggml_openvino_model_cache_extra_cfg(stateful, /*recurrent=*/false);
-                base_extra = base_extra * 131 + (self_contained ? 1u : 0u);
+                base_extra = base_extra * 131 + (weightless_bank ? 2u : (self_contained ? 1u : 0u));
                 base_extra = ggml_openvino_model_cache_mix_string(
                     base_extra, ggml_openvino_getenv_str("GGML_OPENVINO_NPU_TOKEN_EMBD_QUANT"));
                 base_extra = base_extra * 131 + static_cast<uint64_t>(ggml_openvino_getenv_int("GGML_OPENVINO_NPU_KEEP_Q4_0"));
@@ -1870,7 +1873,17 @@ enum ggml_status ov_graph_compute_static(ggml_cgraph * cgraph, const std::shared
                     decode_signature);
             }
 
-            if (self_contained) {
+            std::string weights_path;
+            if (weightless_bank) {
+                // One bank for both models: on import NPUW matches their weights by the hash recorded at compile
+                // time and keeps a single resident copy (no duplicate-uid import as with embedded weights).
+                char shared_bank[96];
+                snprintf(shared_bank, sizeof(shared_bank), "ggml-wl-shared-%016llx-%016llx",
+                         static_cast<unsigned long long>(prefill_fp), static_cast<unsigned long long>(decode_fp));
+                mc_config["NPUW_WEIGHTS_BANK"] = std::string(shared_bank);
+                mc_decode_config["NPUW_WEIGHTS_BANK"] = std::string(shared_bank);
+                weights_path = ggml_openvino_model_cache_weights_path(model_cache_dir, prefill_fp, decode_fp);
+            } else if (self_contained) {
                 char prefill_bank[64];
                 char decode_bank[64];
                 snprintf(prefill_bank, sizeof(prefill_bank), "ggml-sc-prefill-%016llx",
@@ -1907,8 +1920,8 @@ enum ggml_status ov_graph_compute_static(ggml_cgraph * cgraph, const std::shared
             };
             const bool self_contained_mmap =
                 self_contained && ggml_openvino_getenv_int("GGML_OPENVINO_SELF_CONTAINED_MMAP") != 0;
-            const bool skip_weights =
-                self_contained && blob_valid(prefill_fp) && blob_valid(decode_fp);
+            const bool skip_weights = self_contained && blob_valid(prefill_fp) && blob_valid(decode_fp) &&
+                                      (!weightless_bank || ggml_openvino_model_cache_weights_valid(weights_path));
             if (self_contained_mmap && !skip_weights) {
                 throw std::runtime_error(
                     "GGML_OPENVINO_SELF_CONTAINED_MMAP requires valid self-contained blob(s); "
@@ -1970,7 +1983,8 @@ enum ggml_status ov_graph_compute_static(ggml_cgraph * cgraph, const std::shared
                 return model;
             };
 
-            auto build_static_model = [&core, &model_cache_dir, cgraph, self_contained, skip_weights](
+            auto build_static_model = [&core, &model_cache_dir, &weights_path, cgraph, self_contained, weightless_bank,
+                                       skip_weights](
                               std::shared_ptr<GgmlOvDecoder> decoder,
                               const char * tag,
                               std::shared_ptr<ov::Model> model,
@@ -1992,8 +2006,13 @@ enum ggml_status ov_graph_compute_static(ggml_cgraph * cgraph, const std::shared
                 if (skip_weights) {
                     try {
                         std::ifstream blob_in(blob_path, std::ios::binary);
+                        ov::AnyMap import_config = model_config;
+                        if (weightless_bank) {
+                            import_config[ov::weights_path.name()] = weights_path;
+                            import_config[ov::enable_weightless.name()] = true;
+                        }
                         const int64_t import_start_time = ggml_time_us();
-                        compiled_model = core.import_model(blob_in, device, model_config);
+                        compiled_model = core.import_model(blob_in, device, import_config);
                         const int64_t import_end_time = ggml_time_us();
                         if (ggml_openvino_getenv_int("GGML_OPENVINO_PROFILING")) {
                             fprintf(stderr, "ggml-openvino: model cache IMPORT %s: %.3f ms\n", tag,
@@ -2002,7 +2021,8 @@ enum ggml_status ov_graph_compute_static(ggml_cgraph * cgraph, const std::shared
                     } catch (const std::exception & e) {
                         std::remove(blob_path.c_str());
                         std::remove(manifest_path.c_str());
-                        throw std::runtime_error("self-contained cache import failed for " + std::string(tag) +
+                        throw std::runtime_error(std::string(weightless_bank ? "weightless-bank" : "self-contained") +
+                                                 " cache import failed for " + std::string(tag) +
                                                  "; removed the invalid entry, rerun to rebuild it: " + e.what());
                     }
                     infer_request = std::make_shared<ov::InferRequest>(compiled_model.create_infer_request());
@@ -2035,12 +2055,15 @@ enum ggml_status ov_graph_compute_static(ggml_cgraph * cgraph, const std::shared
                     }
                     decoder->clear_model_weights();
                     local_conversion_end_time = local_compile_end_time = ggml_time_us();
-                    GGML_LOG_INFO("ggml-openvino: model cache HIT (self-contained) %s (%s)\n", blob_path.c_str(), tag);
+                    GGML_LOG_INFO("ggml-openvino: model cache HIT (%s) %s (%s)\n",
+                                  weightless_bank ? "weightless bank" : "self-contained", blob_path.c_str(), tag);
                     return;
                 }
 
                 bool imported = false;
-                if (!model_cache_dir.empty() && model_fp != 0) {
+                // A weightless blob can only be imported against the weights file it was exported with, and that file
+                // is rewritten whenever both blobs are not valid, so recompile instead of importing a leftover blob.
+                if (!model_cache_dir.empty() && model_fp != 0 && !weightless_bank) {
                     std::ifstream blob_in(blob_path, std::ios::binary);
                     std::vector<std::string> cached_inputs, cached_outputs;
                     if (blob_in.is_open() && ggml_openvino_model_cache_verify_manifest(manifest_path, cgraph, model_fp,
@@ -2070,7 +2093,7 @@ enum ggml_status ov_graph_compute_static(ggml_cgraph * cgraph, const std::shared
                 if (!imported) {
                     ov::AnyMap compile_config = model_config;
                     if (self_contained) {
-                        compile_config[ov::enable_weightless.name()] = false;
+                        compile_config[ov::enable_weightless.name()] = weightless_bank;
                     }
                     compiled_model = core.compile_model(model, device, compile_config);
                 }
@@ -2099,6 +2122,13 @@ enum ggml_status ov_graph_compute_static(ggml_cgraph * cgraph, const std::shared
                             if (blob_out.is_open()) {
                                 compiled_model.export_model(blob_out);
                                 blob_out.close();
+                                // std::rename does not replace an existing file on Windows, which would keep a stale
+                                // blob from an invalid entry. Drop the old manifest first so the entry stays invalid
+                                // until the new manifest is published.
+                                if (blob_out.good()) {
+                                    std::remove(manifest_path.c_str());
+                                    std::remove(blob_path.c_str());
+                                }
                                 if (blob_out.good() && std::rename(blob_tmp.c_str(), blob_path.c_str()) == 0 &&
                                     std::rename(manifest_publish.c_str(), manifest_path.c_str()) == 0) {
                                     GGML_LOG_INFO("ggml-openvino: model cache WROTE %s (%s)\n", blob_path.c_str(), tag);
@@ -2134,6 +2164,13 @@ enum ggml_status ov_graph_compute_static(ggml_cgraph * cgraph, const std::shared
             std::shared_ptr<ov::Model> model_decode;
             if (!no_kv_cache) {
                 model_decode = convert_static_model(ggml_decoder_decode, "decode", decode_conversion_end_time);
+            }
+            if (weightless_bank && !skip_weights) {
+                // Lay both models' weights out in one file and point their WeightlessCacheAttribute offsets into it
+                // before compiling, so both exported blobs reference the same file.
+                if (!ggml_openvino_model_cache_write_weights(weights_path, {model_prefill, model_decode})) {
+                    throw std::runtime_error("failed to write NPU weights file " + weights_path);
+                }
             }
             if (parallel_compile) {
                 auto prefill_future = std::async(std::launch::async, build_static_model, ggml_decoder_prefill, "prefill",

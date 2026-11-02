@@ -173,6 +173,7 @@ void ggml_openvino_device_config::init() {
         "GGML_OPENVINO_SELF_CONTAINED_BLOB",
         "GGML_OPENVINO_SELF_CONTAINED_MMAP",
         "GGML_OPENVINO_NPU_SHARED_BANK",
+        "GGML_OPENVINO_NPU_WEIGHTLESS_BANK",
         // Build the precise (but O(n_nodes)) graph cache key. Needed by op tests.
         "GGML_OPENVINO_FULL_GRAPH_KEY",
     };
@@ -372,6 +373,15 @@ bool ggml_openvino_npu_decode_unfold_enabled() {
 
 bool ggml_openvino_npu_parallel_compile_enabled() {
     return ggml_openvino_getenv_int("GGML_OPENVINO_NPU_PARALLEL_COMPILE") != 0;
+}
+
+bool ggml_openvino_npu_raw_weight_cache_enabled() {
+    return ggml_openvino_getenv_int("GGML_OPENVINO_SELF_CONTAINED_BLOB") != 0 ||
+           ggml_openvino_npu_weightless_bank_enabled();
+}
+
+bool ggml_openvino_npu_weightless_bank_enabled() {
+    return ggml_openvino_getenv_int("GGML_OPENVINO_NPU_WEIGHTLESS_BANK") != 0;
 }
 
 bool ggml_openvino_shape_from_mask_enabled() {

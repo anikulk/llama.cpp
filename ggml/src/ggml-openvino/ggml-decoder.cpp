@@ -1869,7 +1869,7 @@ std::shared_ptr<ov::Node> GgmlOvDecoder::create_weight_node(ggml_tensor * tensor
     if (ggml_is_quantized(tensor->type)) {
         auto use_bias = naive;
         if (is_ov_buffer) {
-            const bool preserve_raw = ggml_openvino_getenv_int("GGML_OPENVINO_SELF_CONTAINED_BLOB") != 0;
+            const bool preserve_raw = ggml_openvino_npu_raw_weight_cache_enabled();
             if (preserve_raw) {
                 // A later context must fingerprint the same raw GGUF bytes before importing its
                 // self-contained blob, so keep the model buffer immutable in this mode.
