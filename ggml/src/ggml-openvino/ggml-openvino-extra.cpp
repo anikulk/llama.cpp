@@ -178,6 +178,8 @@ void ggml_openvino_device_config::init() {
         "GGML_OPENVINO_SELF_CONTAINED_BLOB",
         "GGML_OPENVINO_SELF_CONTAINED_MMAP",
         "GGML_OPENVINO_NPU_SHARED_BANK",
+        "GGML_OPENVINO_KV_ONLY_PREFILL",
+        "GGML_OPENVINO_NPU_KV_ONLY_PREFILL",
         "GGML_OPENVINO_NPU_WEIGHTLESS_BANK",
         // Build the precise (but O(n_nodes)) graph cache key. Needed by op tests.
         "GGML_OPENVINO_FULL_GRAPH_KEY",
@@ -399,6 +401,15 @@ bool ggml_openvino_npu_kv_on_demand_enabled() {
 bool ggml_openvino_npu_kv_head_major_enabled() {
     return ggml_openvino_npu_kv_on_demand_enabled() && ggml_openvino_npu_decode_bucket() > 0 &&
            ggml_openvino_kv_slice_enabled();
+}
+
+bool ggml_openvino_kv_only_prefill_enabled() {
+    // On by default; it only takes effect for graphs with KV-shared layers. GGML_OPENVINO_NPU_KV_ONLY_PREFILL is the
+    // earlier, NPU-only name.
+    if (ggml_openvino_getenv_str("GGML_OPENVINO_KV_ONLY_PREFILL") != nullptr) {
+        return ggml_openvino_getenv_int("GGML_OPENVINO_KV_ONLY_PREFILL") != 0;
+    }
+    return ggml_openvino_getenv_int("GGML_OPENVINO_NPU_KV_ONLY_PREFILL", 1) != 0;
 }
 
 bool ggml_openvino_npu_raw_weight_cache_enabled() {

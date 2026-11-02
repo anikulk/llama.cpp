@@ -102,6 +102,8 @@ struct decoder_runtime_ctx {
     int decode_attention_size = -1;
     std::string shared_key;
     std::map<int, std::shared_ptr<ov::InferRequest>> decode_window_requests;
+    // The prefill model only writes the KV cache; logits come from one decode step (GGML_OPENVINO_KV_ONLY_PREFILL).
+    bool kv_only_prefill = false;
 };
 
 struct ov_compiled_graph {
@@ -125,6 +127,7 @@ struct ov_compiled_graph {
     std::shared_ptr<ggml_openvino_weights_layout> weights_layout;
     // Compute params the pair's decode model was built with; window models derive from them.
     ComputeParams decode_c_params;
+    bool kv_only_prefill = false;
 };
 
 // Only compilation and cache publication use this mutex. Requests, decoders and

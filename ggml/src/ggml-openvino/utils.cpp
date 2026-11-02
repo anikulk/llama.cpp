@@ -1893,7 +1893,9 @@ static void build_static_model(const static_build_args & a,
                 names_in.push_back(name);
             }
         }
-        for (const auto & name : decoder->get_model_output_names()) {
+        // A KV-only prefill model keeps only the cache outputs (pass::KeepCacheResults), in decoder order.
+        for (const auto & name : decoder->is_kv_only_outputs() ? decoder->get_cache_output_names() :
+                                                                 decoder->get_model_output_names()) {
             names_out.push_back(name);
         }
         if (names_in.size() != compiled_model.inputs().size() || names_out.size() != compiled_model.outputs().size()) {
@@ -1994,6 +1996,79 @@ static void build_static_model(const static_build_args & a,
     }
 }
 
+// True if some attention layers write no KV cache of their own, i.e. they read another layer's cache (Gemma 3n/4
+// E-series). Those layers only matter for the tokens whose outputs are needed.
+static bool has_kv_shared_attention(const ggml_cgraph * cgraph) {
+    int n_attn = 0;
+    int n_kv_writes = 0;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+            n_attn++;
+        } else if (node->op == GGML_OP_SET_ROWS && node->view_src != nullptr &&
+                   GgmlOvDecoder::is_kvcache(node->view_src, nullptr)) {
+            n_kv_writes++;
+        }
+    }
+    // Every layer with its own cache writes K and V.
+    return n_attn > 0 && 2 * n_attn > n_kv_writes;
+}
+
+// Input of the decode model for token |row| of the current prefill graph, used to compute that token's outputs after a
+// KV-only prefill. The decoder must be in decode mode so that the KV cache and the masks bind at full context.
+static ov::Tensor get_ov_input_tensor_static_decode_row(const std::shared_ptr<GgmlOvDecoder> & ggml_decoder,
+                                                        const std::string & param_name,
+                                                        int64_t row,
+                                                        const ov::Shape & port_shape) {
+    if (ggml_decoder->get_model_extra_inputs().count(param_name)) {
+        return get_ov_input_tensor(ggml_decoder, param_name);
+    }
+    const auto * ggml_tensor = ggml_decoder->get_input_ggml_tensor(param_name);
+    const auto * op = ggml_decoder->get_tensor_used_op(ggml_tensor);
+    const size_t input_len = ggml_decoder->get_input_len();
+
+    ov::Tensor input_tensor;
+    if (GgmlOvDecoder::is_inp_tok(ggml_tensor, op) || GgmlOvDecoder::is_inp_pos(ggml_tensor, op) ||
+        GgmlOvDecoder::is_kv_idx(ggml_tensor, op)) {
+        // IMROPE stores one position plane per t/h/w/e, each input_len long.
+        const int n_planes = GgmlOvDecoder::is_inp_pos(ggml_tensor, op) ? GgmlOvDecoder::get_inp_pos_n_planes(op) : 1;
+        const size_t element_size = ggml_type_size(ggml_tensor->type);
+        input_tensor = ov::Tensor(GgmlOvDecoder::get_ov_type(ggml_tensor), ov::Shape{1, 1, 1, (size_t) n_planes});
+        for (int p = 0; p < n_planes; p++) {
+            std::memcpy(static_cast<char *>(input_tensor.data()) + p * element_size,
+                        static_cast<const char *>(ggml_tensor->data) + (p * input_len + row) * element_size,
+                        element_size);
+        }
+    } else if (GgmlOvDecoder::is_output_idx(ggml_tensor, op)) {
+        input_tensor = ov::Tensor(GgmlOvDecoder::get_ov_type(ggml_tensor), ov::Shape{1, 1, 1, 1});
+        *input_tensor.data<int32_t>() = 0;
+    } else if (GgmlOvDecoder::is_inp_scale_rows(ggml_tensor, op)) {
+        input_tensor = ov::Tensor(ov::element::f32, ov::Shape{1, 1, 1, 1});
+        *input_tensor.data<float>() = static_cast<const float *>(ggml_tensor->data)[row];
+    } else if (GgmlOvDecoder::is_inp_mask(ggml_tensor, op)) {
+        const size_t cols = ggml_tensor->ne[0];
+        const size_t context_size = port_shape.back();
+        if (ggml_tensor->type == GGML_TYPE_F16) {
+            const auto * src = static_cast<const ggml_fp16_t *>(ggml_tensor->data) + row * cols;
+            auto padded = pad_input<ggml_fp16_t>(src, 1, cols, 1, context_size, GGML_FP32_TO_FP16(-INFINITY));
+            input_tensor = ov::Tensor(ov::element::f16, port_shape);
+            std::memcpy(input_tensor.data(), padded.data(), padded.size() * sizeof(ggml_fp16_t));
+        } else {
+            const auto * src = static_cast<const float *>(ggml_tensor->data) + row * cols;
+            auto padded = pad_input<float>(src, 1, cols, 1, context_size, -INFINITY);
+            input_tensor = ov::Tensor(ov::element::f32, port_shape);
+            std::memcpy(input_tensor.data(), padded.data(), padded.size() * sizeof(float));
+        }
+    } else {
+        input_tensor = get_ov_input_tensor(ggml_decoder, param_name);
+    }
+    if (input_tensor.get_shape() != port_shape) {
+        throw std::runtime_error("KV-only prefill: decode input " + param_name + " has shape " +
+                                 input_tensor.get_shape().to_string() + ", expected " + port_shape.to_string());
+    }
+    return input_tensor;
+}
+
 enum ggml_status ov_graph_compute_static(ggml_cgraph * cgraph, const std::shared_ptr<ov_runtime_context> & r_ctx) {
     auto & core = ov_singleton_core();
 
@@ -2035,6 +2110,14 @@ enum ggml_status ov_graph_compute_static(ggml_cgraph * cgraph, const std::shared
                 is_prefill ? "prefill" : "decode", static_cast<long long>(input_tokens), prefill_chunk_size);
     }
     const ov::AnyMap compile_config = no_kv_cache ? ggml_openvino_npu_without_npuw(config) : config;
+    // Decided per compiled pair from the graph that triggers the compile; later calls follow entry->kv_only_prefill.
+    // The output step binds the full KV cache to the pair's decode model, so it needs a full-context decode window.
+    const bool kv_only_prefill = !no_kv_cache && ggml_openvino_kv_only_prefill_enabled() &&
+                                 !ggml_openvino_npu_hfa_prefill_enabled() && ggml_openvino_npu_decode_bucket() == 0 &&
+                                 c_params.output_len <= 1 && has_kv_shared_attention(cgraph);
+    std::shared_ptr<ov::InferRequest> decode_request_for_outputs;
+    std::vector<std::string> decode_input_names_for_outputs;
+    std::vector<std::string> decode_output_names_for_outputs;
     if (m_params.n_heads_kv == -1) {
         prefill_chunk_size = inp_pos->ne[0];
     }
@@ -2132,6 +2215,9 @@ enum ggml_status ov_graph_compute_static(ggml_cgraph * cgraph, const std::shared
                                                 r_ctx->ov_input_names_cache.at(key);
             ov_output_names_local = is_prefill ? r_ctx->ov_output_names_cache_prefill.at(key) :
                                                  r_ctx->ov_output_names_cache.at(key);
+            decode_request_for_outputs = r_ctx->infer_request_cache.at(key);
+            decode_input_names_for_outputs = r_ctx->ov_input_names_cache.at(key);
+            decode_output_names_for_outputs = r_ctx->ov_output_names_cache.at(key);
         }
 
         decoder_end_time = ggml_time_us();
@@ -2160,7 +2246,9 @@ enum ggml_status ov_graph_compute_static(ggml_cgraph * cgraph, const std::shared
         auto local_decoder = std::make_shared<GgmlOvDecoder>(cgraph, m_params, c_params, weight_names, is_static,
                                                              stateful, false, is_prefill, prefill_chunk_size);
         const std::string shared_key =
-            cache_enabled ? compiled_graph_key(cgraph, *local_decoder, device, prefill_chunk_size) : "";
+            cache_enabled ? compiled_graph_key(cgraph, *local_decoder, device, prefill_chunk_size) +
+                                (kv_only_prefill ? "|kv-only-prefill" : "") :
+                            "";
         auto shared_it = shared_cache->graphs.find(shared_key);
         if (!shared_key.empty() && shared_it != shared_cache->graphs.end()) {
             auto & compiled = shared_it->second;
@@ -2184,6 +2272,10 @@ enum ggml_status ov_graph_compute_static(ggml_cgraph * cgraph, const std::shared
             r_ctx->ov_output_names_cache[key] = compiled.output_names;
             r_ctx->ov_input_names_cache_prefill[key] = compiled.prefill_input_names;
             r_ctx->ov_output_names_cache_prefill[key] = compiled.prefill_output_names;
+            entry->kv_only_prefill = compiled.kv_only_prefill;
+            decode_request_for_outputs = decode_request;
+            decode_input_names_for_outputs = compiled.input_names;
+            decode_output_names_for_outputs = compiled.output_names;
             decoder_end_time = conversion_end_time = compile_end_time = ggml_time_us();
             GGML_LOG_DEBUG("ggml-openvino: shared compiled model HIT (static)\n");
         } else {
@@ -2225,6 +2317,7 @@ enum ggml_status ov_graph_compute_static(ggml_cgraph * cgraph, const std::shared
                     base_extra, ggml_openvino_getenv_str("GGML_OPENVINO_NPU_TOKEN_EMBD_QUANT"));
                 base_extra = base_extra * 131 + (ggml_openvino_kv_slice_enabled() ? 1u : 0u);
                 base_extra = base_extra * 131 + (ggml_openvino_npu_kv_head_major_enabled() ? 1u : 0u);
+                base_extra = base_extra * 131 + (kv_only_prefill ? 1u : 0u);
                 base_extra = ggml_openvino_model_cache_mix_string(
                     base_extra, ggml_openvino_getenv_str("GGML_OPENVINO_NPU_CONFIG"));
                 base_extra = ggml_openvino_model_cache_mix_string(
@@ -2331,6 +2424,7 @@ enum ggml_status ov_graph_compute_static(ggml_cgraph * cgraph, const std::shared
 
             auto ggml_decoder_prefill = std::make_shared<GgmlOvDecoder>(
                 cgraph, m_params, c_params, model_weights, is_static, stateful, false, true, prefill_chunk_size);
+            ggml_decoder_prefill->set_kv_only_outputs(kv_only_prefill);
             auto ggml_decoder_decode =
                 no_kv_cache ? ggml_decoder_prefill :
                               std::make_shared<GgmlOvDecoder>(cgraph, m_params, decode_c_params, model_weights,
@@ -2442,6 +2536,13 @@ enum ggml_status ov_graph_compute_static(ggml_cgraph * cgraph, const std::shared
             entry->decode_attention_size = decode_c_params.attention_size;
             entry->shared_key = shared_key;
             entry->decode_window_requests.clear();
+            entry->kv_only_prefill = kv_only_prefill;
+            decode_request_for_outputs = infer_request_decode;
+            decode_input_names_for_outputs = names_in_decode;
+            decode_output_names_for_outputs = names_out_decode;
+            if (kv_only_prefill) {
+                GGML_LOG_INFO("ggml-openvino: KV-only prefill model (outputs via one decode step)\n");
+            }
 
             if (!shared_key.empty()) {
                 ov_compiled_graph graph;
@@ -2460,6 +2561,7 @@ enum ggml_status ov_graph_compute_static(ggml_cgraph * cgraph, const std::shared
                 graph.weights_path = weights_path;
                 graph.weights_layout = decode_bucket > 0 ? std::move(weights_layout) : nullptr;
                 graph.decode_c_params = decode_c_params;
+                graph.kv_only_prefill = kv_only_prefill;
                 shared_cache->graphs.emplace(shared_key, std::move(graph));
                 pair_built = true;
             }
@@ -2733,6 +2835,60 @@ enum ggml_status ov_graph_compute_static(ggml_cgraph * cgraph, const std::shared
                 for (size_t i = 0; i < ov_output_names_local.size(); i++) {
                     const auto output_tensor = infer_request->get_output_tensor(i);
                     print_output_tensor_info(ov_output_names_local[i], output_tensor, nullptr);
+                }
+            }
+        }
+
+        if (entry->kv_only_prefill) {
+            // The prefill model only filled the KV cache. Compute the outputs of the requested token by running the
+            // decode model on it: it rewrites that token's KV rows with the same values and runs the layers the
+            // prefill model dropped, reading the now complete cache.
+            const ggml_tensor * out_ids = nullptr;
+            for (const auto & [name, info] : ggml_decoder->get_model_inputs()) {
+                const ggml_tensor * tensor = ggml_decoder->get_input_ggml_tensor(name);
+                if (tensor != nullptr &&
+                    GgmlOvDecoder::is_output_idx(tensor, ggml_decoder->get_tensor_used_op(tensor))) {
+                    out_ids = tensor;
+                    break;
+                }
+            }
+            const int64_t n_outputs = out_ids != nullptr ? out_ids->ne[0] : 0;
+            if (n_outputs > 1) {
+                throw std::runtime_error(
+                    "GGML_OPENVINO_KV_ONLY_PREFILL supports one output token per batch; got " +
+                    std::to_string(n_outputs));
+            }
+            if (n_outputs == 1) {
+                const int64_t row = static_cast<const int32_t *>(out_ids->data)[0];
+                const auto & compiled_inputs = decode_request_for_outputs->get_compiled_model().inputs();
+                ggml_decoder->m_is_prefill = false;
+                try {
+                    for (size_t i = 0; i < decode_input_names_for_outputs.size(); i++) {
+                        decode_request_for_outputs->set_input_tensor(
+                            i, get_ov_input_tensor_static_decode_row(ggml_decoder, decode_input_names_for_outputs[i],
+                                                                     row, compiled_inputs[i].get_shape()));
+                    }
+                    const auto & model_outputs = ggml_decoder->get_model_outputs();
+                    for (size_t i = 0; i < decode_output_names_for_outputs.size(); i++) {
+                        auto it = model_outputs.find(decode_output_names_for_outputs[i]);
+                        if (it == model_outputs.end() || ggml_nbytes(it->second) == 0) {
+                            continue;
+                        }
+                        decode_request_for_outputs->set_output_tensor(
+                            i, create_ov_output_tensor(ggml_decoder, decode_request_for_outputs, i, it->second));
+                    }
+                } catch (...) {
+                    ggml_decoder->m_is_prefill = true;
+                    throw;
+                }
+                ggml_decoder->m_is_prefill = true;
+                const int64_t decode_start = ggml_time_us();
+                decode_request_for_outputs->infer();
+                const int64_t decode_us = ggml_time_us() - decode_start;
+                ov_raw_infer_total += decode_us;
+                if (ggml_openvino_getenv_int("GGML_OPENVINO_PROFILING")) {
+                    fprintf(stderr, "GGML OpenVINO profiling: KV-only prefill output step: row=%lld, raw infer=%.3f ms\n",
+                            static_cast<long long>(row), decode_us / 1000.0);
                 }
             }
         }
