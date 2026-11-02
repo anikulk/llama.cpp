@@ -8,9 +8,9 @@
 // GGUF mmap instead of allocating the private OpenVINO model buffer. This mode is
 // import-only and fails clearly if either required blob is missing or invalid.
 // GGML_OPENVINO_NPU_WEIGHTLESS_BANK=1 is the same raw-weight flow, but exports weightless
-// prefill/decode blobs plus ONE shared <prefill>-<decode>.weights.bin. Warm import reads the
-// weights from that file (ov::weights_path) and NPUW deduplicates the two models into one bank,
-// so the weights are stored once on disk and resident once in the bank.
+// prefill/decode blobs plus ONE weights file per model, shared by all its blob pairs. Warm import
+// reads the weights from that file (ov::weights_path) and NPUW deduplicates the two models into one
+// bank, so the weights are stored once on disk and resident once in the bank.
 
 #include "ggml.h"
 
@@ -21,6 +21,7 @@
 
 namespace ov {
 class Model;
+class Node;
 }
 
 bool ggml_openvino_model_cache_only();
@@ -71,13 +72,27 @@ bool ggml_openvino_model_cache_verify_manifest(const std::string & path,
                                                std::vector<std::string> & inputs,
                                                std::vector<std::string> & outputs);
 
-// GGML_OPENVINO_NPU_WEIGHTLESS_BANK: path of the weights file shared by a prefill/decode blob pair.
-std::string ggml_openvino_model_cache_weights_path(const std::string & dir, uint64_t prefill_fp, uint64_t decode_fp);
+// GGML_OPENVINO_NPU_WEIGHTLESS_BANK: one weights file per model and weight settings, shared by every
+// prefill/decode blob pair of that model; each pair records the file it uses in a .weights.ref.
 
-// Give every weightless-tagged Constant of |models| an offset into one weights file (one region per distinct
-// data pointer), retag its WeightlessCacheAttribute with that offset, and write the file. Call before compiling.
-bool ggml_openvino_model_cache_write_weights(const std::string & path,
-                                             const std::vector<std::shared_ptr<ov::Model>> & models);
+// Identity of the extracted weights: source weight identities plus the settings that change their bytes.
+uint64_t ggml_openvino_model_cache_weights_fingerprint(const ggml_cgraph * cgraph, uint64_t weight_cfg);
+
+// Path of the reference file naming the weights file a prefill/decode blob pair was exported with.
+std::string ggml_openvino_model_cache_weights_ref_path(const std::string & dir, uint64_t prefill_fp, uint64_t decode_fp);
+
+// Lay the weight Constants (reachable from |weight_roots|) of |models| out in one file, retag their
+// WeightlessCacheAttribute with the file offsets, untag all other Constants so they stay embedded in the blob,
+// and write the file unless an identical one exists. Call before compiling. Returns the file path, empty on error.
+std::string ggml_openvino_model_cache_prepare_weights(const std::string & dir,
+                                                      uint64_t weights_fp,
+                                                      const std::vector<std::shared_ptr<ov::Node>> & weight_roots,
+                                                      const std::vector<std::shared_ptr<ov::Model>> & models);
 
 // True if the weights file is complete (its size matches the size record written after it).
 bool ggml_openvino_model_cache_weights_valid(const std::string & path);
+
+bool ggml_openvino_model_cache_write_weights_ref(const std::string & ref_path, const std::string & weights_path);
+
+// Weights file named by a reference file, or empty if the reference is missing or malformed.
+std::string ggml_openvino_model_cache_read_weights_ref(const std::string & dir, const std::string & ref_path);

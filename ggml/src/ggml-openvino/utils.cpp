@@ -1874,15 +1874,19 @@ enum ggml_status ov_graph_compute_static(ggml_cgraph * cgraph, const std::shared
             }
 
             std::string weights_path;
+            std::string weights_ref_path;
             if (weightless_bank) {
                 // One bank for both models: on import NPUW matches their weights by the hash recorded at compile
-                // time and keeps a single resident copy (no duplicate-uid import as with embedded weights).
+                // time and keeps a single resident copy (no duplicate-uid import as with embedded weights). The bank
+                // stays per pair: pairs compiled separately have unrelated hashes and would not share it anyway.
                 char shared_bank[96];
                 snprintf(shared_bank, sizeof(shared_bank), "ggml-wl-shared-%016llx-%016llx",
                          static_cast<unsigned long long>(prefill_fp), static_cast<unsigned long long>(decode_fp));
                 mc_config["NPUW_WEIGHTS_BANK"] = std::string(shared_bank);
                 mc_decode_config["NPUW_WEIGHTS_BANK"] = std::string(shared_bank);
-                weights_path = ggml_openvino_model_cache_weights_path(model_cache_dir, prefill_fp, decode_fp);
+                // The weights file is shared by every pair of the model; the pair's reference names it.
+                weights_ref_path = ggml_openvino_model_cache_weights_ref_path(model_cache_dir, prefill_fp, decode_fp);
+                weights_path = ggml_openvino_model_cache_read_weights_ref(model_cache_dir, weights_ref_path);
             } else if (self_contained) {
                 char prefill_bank[64];
                 char decode_bank[64];
@@ -1921,7 +1925,8 @@ enum ggml_status ov_graph_compute_static(ggml_cgraph * cgraph, const std::shared
             const bool self_contained_mmap =
                 self_contained && ggml_openvino_getenv_int("GGML_OPENVINO_SELF_CONTAINED_MMAP") != 0;
             const bool skip_weights = self_contained && blob_valid(prefill_fp) && blob_valid(decode_fp) &&
-                                      (!weightless_bank || ggml_openvino_model_cache_weights_valid(weights_path));
+                                      (!weightless_bank || (!weights_path.empty() &&
+                                                            ggml_openvino_model_cache_weights_valid(weights_path)));
             if (self_contained_mmap && !skip_weights) {
                 throw std::runtime_error(
                     "GGML_OPENVINO_SELF_CONTAINED_MMAP requires valid self-contained blob(s); "
@@ -2166,10 +2171,19 @@ enum ggml_status ov_graph_compute_static(ggml_cgraph * cgraph, const std::shared
                 model_decode = convert_static_model(ggml_decoder_decode, "decode", decode_conversion_end_time);
             }
             if (weightless_bank && !skip_weights) {
-                // Lay both models' weights out in one file and point their WeightlessCacheAttribute offsets into it
-                // before compiling, so both exported blobs reference the same file.
-                if (!ggml_openvino_model_cache_write_weights(weights_path, {model_prefill, model_decode})) {
-                    throw std::runtime_error("failed to write NPU weights file " + weights_path);
+                // Point both models' weight offsets into the model's shared weights file before compiling (writing it
+                // unless an identical one exists), then record it for this pair before the blobs are published.
+                std::vector<std::shared_ptr<ov::Node>> weight_roots;
+                for (const auto & [name, node] : model_weights) {
+                    weight_roots.push_back(node);
+                }
+                const uint64_t weights_fp = ggml_openvino_model_cache_weights_fingerprint(
+                    cgraph, static_cast<uint64_t>(ggml_openvino_get_npu_requant_type()));
+                weights_path = ggml_openvino_model_cache_prepare_weights(model_cache_dir, weights_fp, weight_roots,
+                                                                         {model_prefill, model_decode});
+                if (weights_path.empty() ||
+                    !ggml_openvino_model_cache_write_weights_ref(weights_ref_path, weights_path)) {
+                    throw std::runtime_error("failed to write the NPU weights file for " + weights_ref_path);
                 }
             }
             if (parallel_compile) {

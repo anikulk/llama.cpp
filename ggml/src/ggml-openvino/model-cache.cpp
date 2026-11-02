@@ -21,6 +21,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #if defined(_WIN32)
@@ -495,55 +496,114 @@ bool ggml_openvino_model_cache_verify_manifest(const std::string & path,
     return f.eof();
 }
 
-std::string ggml_openvino_model_cache_weights_path(const std::string & dir, uint64_t prefill_fp, uint64_t decode_fp) {
-    // NPUW's weightless import is extension-sensitive: the weights file must end in .bin.
-    return dir + "/" + hex64(prefill_fp) + "-" + hex64(decode_fp) + ".weights.bin";
+uint64_t ggml_openvino_model_cache_weights_fingerprint(const ggml_cgraph * cgraph, uint64_t weight_cfg) {
+    // Only what decides the extracted weight bytes: the source weights and the requantization settings. Graph
+    // shapes are deliberately left out so every prefill/decode pair of the model shares one weights file.
+    static const char * weight_settings[] = {
+        "GGML_OPENVINO_REQUANT_KQUANT",       "GGML_OPENVINO_EXACT_ZERO_POINT", "GGML_OPENVINO_NPU_REQUANT_POLICY",
+        "GGML_OPENVINO_NPU_TOKEN_EMBD_QUANT", "GGML_OPENVINO_NPU_KEEP_Q4_0",    "GGML_OPENVINO_REDUCE_COMPILE_MEM",
+        "GGML_OPENVINO_MEMORY_OPTIMIZE",
+    };
+    uint64_t h = FNV_OFFSET;
+    h = fnv1a(h, "weights-v1", sizeof("weights-v1"));
+    for (const char * name : weight_settings) {
+        const char * value = ggml_openvino_getenv_str(name, "");
+        h = fnv1a(h, value, strlen(value) + 1);
+    }
+    for_each_weight(cgraph, [&](const ggml_tensor * t) { h = fnv1a_u64(h, weight_fingerprint(t)); });
+    return fnv1a_u64(h, weight_cfg);
 }
 
-bool ggml_openvino_model_cache_write_weights(const std::string & path,
-                                             const std::vector<std::shared_ptr<ov::Model>> & models) {
-    // NPUW maps every Constant to its offset by data pointer and rejects one pointer with two offsets, so key the
-    // layout by data pointer. Prefill and decode share their weight Constants, so a shared weight is one region
-    // and both blobs resolve it to the same bytes.
+std::string ggml_openvino_model_cache_weights_ref_path(const std::string & dir, uint64_t prefill_fp, uint64_t decode_fp) {
+    return dir + "/" + hex64(prefill_fp) + "-" + hex64(decode_fp) + ".weights.ref";
+}
+
+std::string ggml_openvino_model_cache_prepare_weights(const std::string & dir,
+                                                      uint64_t weights_fp,
+                                                      const std::vector<std::shared_ptr<ov::Node>> & weight_roots,
+                                                      const std::vector<std::shared_ptr<ov::Model>> & models) {
+    // NPUW maps every Constant to its offset by data pointer and rejects one pointer with two offsets, so the file
+    // has one region per distinct data pointer. Regions are the tagged Constants of the model weights, collected
+    // from the weight nodes in their (name-sorted) order, which makes the layout independent of the graph shape.
     struct region {
         const void * data;
         size_t size;
         size_t offset;
     };
     constexpr size_t alignment = 64;
+    const auto & wca_key = ov::WeightlessCacheAttribute::get_type_info_static();
     std::vector<region> regions;
     std::unordered_map<const void *, size_t> region_of;
-    std::vector<std::shared_ptr<ov::op::v0::Constant>> constants;
+    std::unordered_set<const ov::Node *> visited;
+    for (const auto & root : weight_roots) {
+        std::vector<ov::Node *> stack;
+        if (root) {
+            stack.push_back(root.get());
+        }
+        while (!stack.empty()) {
+            ov::Node * node = stack.back();
+            stack.pop_back();
+            if (!visited.insert(node).second) {
+                continue;
+            }
+            if (auto * cnst = ov::as_type<ov::op::v0::Constant>(node)) {
+                if (cnst->get_rt_info().count(wca_key) == 0 || cnst->get_data_ptr() == nullptr ||
+                    cnst->get_byte_size() == 0) {
+                    continue;
+                }
+                auto [it, inserted] = region_of.emplace(cnst->get_data_ptr(), regions.size());
+                if (inserted) {
+                    regions.push_back({ cnst->get_data_ptr(), cnst->get_byte_size(), 0 });
+                } else {
+                    regions[it->second].size = std::max(regions[it->second].size, cnst->get_byte_size());
+                }
+                continue;
+            }
+            // Push in reverse so inputs are visited in input order.
+            for (size_t i = node->get_input_size(); i-- > 0;) {
+                stack.push_back(node->get_input_node_ptr(i));
+            }
+        }
+    }
+
+    size_t total = 0;
+    uint64_t layout = FNV_OFFSET;
+    for (auto & r : regions) {
+        r.offset = total;
+        layout = fnv1a_u64(fnv1a_u64(layout, r.offset), r.size);
+        total = (total + r.size + alignment - 1) / alignment * alignment;
+    }
+
+    // Point every model's weight Constants at their region. Other tagged Constants are graph-specific (masks, shape
+    // tables): drop their tag so NPUW embeds them in the blob instead of the shared file.
+    size_t embedded = 0;
+    size_t embedded_bytes = 0;
     for (const auto & model : models) {
         if (!model) {
             continue;
         }
         for (const auto & node : model->get_ordered_ops()) {
             auto cnst = ov::as_type_ptr<ov::op::v0::Constant>(node);
-            // Only Constants translate_session tagged for weightless caching; the rest stay embedded in the blob.
-            if (!cnst || cnst->get_rt_info().count(ov::WeightlessCacheAttribute::get_type_info_static()) == 0 ||
-                cnst->get_data_ptr() == nullptr || cnst->get_byte_size() == 0) {
+            if (!cnst || cnst->get_rt_info().count(wca_key) == 0) {
                 continue;
             }
-            constants.push_back(cnst);
-            auto [it, inserted] = region_of.emplace(cnst->get_data_ptr(), regions.size());
-            if (inserted) {
-                regions.push_back({ cnst->get_data_ptr(), cnst->get_byte_size(), 0 });
+            auto it = region_of.find(cnst->get_data_ptr());
+            if (it != region_of.end() && cnst->get_byte_size() <= regions[it->second].size) {
+                cnst->get_rt_info()[wca_key] = ov::WeightlessCacheAttribute(
+                    cnst->get_byte_size(), regions[it->second].offset, cnst->get_element_type());
             } else {
-                regions[it->second].size = std::max(regions[it->second].size, cnst->get_byte_size());
+                cnst->get_rt_info().erase(wca_key);
+                ++embedded;
+                embedded_bytes += cnst->get_byte_size();
             }
         }
     }
 
-    size_t total = 0;
-    for (auto & r : regions) {
-        r.offset = total;
-        total = (total + r.size + alignment - 1) / alignment * alignment;
-    }
-    for (const auto & cnst : constants) {
-        const auto & r = regions[region_of.at(cnst->get_data_ptr())];
-        cnst->get_rt_info()[ov::WeightlessCacheAttribute::get_type_info_static()] =
-            ov::WeightlessCacheAttribute(cnst->get_byte_size(), r.offset, cnst->get_element_type());
+    const std::string path = dir + "/" + hex64(weights_fp) + "-" + hex64(layout) + ".weights.bin";
+    if (ggml_openvino_model_cache_weights_valid(path)) {
+        GGML_LOG_INFO("ggml-openvino: model cache REUSE %s (%zu regions; %zu constants embedded, %.1f KiB)\n",
+                      path.c_str(), regions.size(), embedded, embedded_bytes / 1024.0);
+        return path;
     }
 
     // Publish the data file first and the size record last, so a valid record always describes a complete file.
@@ -553,7 +613,7 @@ bool ggml_openvino_model_cache_write_weights(const std::string & path,
     {
         std::ofstream f(data_tmp, std::ios::binary | std::ios::trunc);
         if (!f.is_open()) {
-            return false;
+            return std::string();
         }
         static const char zeros[alignment] = {};
         size_t pos = 0;
@@ -566,7 +626,7 @@ bool ggml_openvino_model_cache_write_weights(const std::string & path,
         f.close();
         if (!f.good()) {
             std::remove(data_tmp.c_str());
-            return false;
+            return std::string();
         }
     }
     {
@@ -576,19 +636,20 @@ bool ggml_openvino_model_cache_write_weights(const std::string & path,
         if (!f.good()) {
             std::remove(data_tmp.c_str());
             std::remove(meta_tmp.c_str());
-            return false;
+            return std::string();
         }
     }
+    // std::rename does not replace an existing file on Windows.
     std::remove(meta_path.c_str());
     std::remove(path.c_str());
     if (std::rename(data_tmp.c_str(), path.c_str()) != 0 || std::rename(meta_tmp.c_str(), meta_path.c_str()) != 0) {
         std::remove(data_tmp.c_str());
         std::remove(meta_tmp.c_str());
-        return false;
+        return std::string();
     }
-    GGML_LOG_INFO("ggml-openvino: model cache WROTE %s (%zu regions, %.1f MiB)\n", path.c_str(), regions.size(),
-                  total / 1024.0 / 1024.0);
-    return true;
+    GGML_LOG_INFO("ggml-openvino: model cache WROTE %s (%zu regions, %.1f MiB; %zu constants embedded, %.1f KiB)\n",
+                  path.c_str(), regions.size(), total / 1024.0 / 1024.0, embedded, embedded_bytes / 1024.0);
+    return path;
 }
 
 bool ggml_openvino_model_cache_weights_valid(const std::string & path) {
@@ -600,4 +661,35 @@ bool ggml_openvino_model_cache_weights_valid(const std::string & path) {
     }
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     return f.is_open() && static_cast<uint64_t>(f.tellg()) == size;
+}
+
+bool ggml_openvino_model_cache_write_weights_ref(const std::string & ref_path, const std::string & weights_path) {
+    const size_t slash = weights_path.find_last_of("/\\");
+    const std::string name = slash == std::string::npos ? weights_path : weights_path.substr(slash + 1);
+    const std::string tmp = ggml_openvino_model_cache_temp_path(ref_path);
+    {
+        std::ofstream f(tmp, std::ios::trunc);
+        f << name << "\n";
+        f.close();
+        if (!f.good()) {
+            std::remove(tmp.c_str());
+            return false;
+        }
+    }
+    std::remove(ref_path.c_str());
+    if (std::rename(tmp.c_str(), ref_path.c_str()) != 0) {
+        std::remove(tmp.c_str());
+        return false;
+    }
+    return true;
+}
+
+std::string ggml_openvino_model_cache_read_weights_ref(const std::string & dir, const std::string & ref_path) {
+    std::ifstream f(ref_path);
+    std::string name;
+    // The reference names a file in the cache directory, never a path.
+    if (!(f >> name) || name.find_first_of("/\\") != std::string::npos || name.find("..") != std::string::npos) {
+        return std::string();
+    }
+    return dir + "/" + name;
 }

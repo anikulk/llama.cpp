@@ -45,15 +45,13 @@ A missing or incompatible graph fails with an error instead of compiling with ab
 
 # NPU weightless weights bank
 
-On NPU, `GGML_OPENVINO_NPU_WEIGHTLESS_BANK=1` (with `GGML_OPENVINO_COMPILED_MODEL_CACHE_DIR`) caches the static prefill and decode graphs as weightless blobs plus one shared `<prefill>-<decode>.weights.bin`. Each distinct weight is stored once in that file, and both blobs reference it by offset. On a warm run both blobs are imported against the file, with no requantization, graph conversion or compilation, and NPUW keeps a single resident copy of the weights for both graphs. It needs no OpenVINO patch, unlike `GGML_OPENVINO_SELF_CONTAINED_BLOB` with `GGML_OPENVINO_NPU_SHARED_BANK`, which embeds the full weights in each blob.
+On NPU, `GGML_OPENVINO_NPU_WEIGHTLESS_BANK=1` (with `GGML_OPENVINO_COMPILED_MODEL_CACHE_DIR`) caches the static prefill and decode graphs as weightless blobs. The weights go into one `.weights.bin` per model and weight settings, which every prefill/decode pair of that model shares, so different context or batch sizes (for example several `llama-bench` tests) do not store the weights again. Each pair records the file it uses in a small `.weights.ref`. On a warm run both blobs are imported against the file with no requantization, graph conversion or compilation, and NPUW keeps a single resident copy of the weights for both graphs. Unlike `GGML_OPENVINO_SELF_CONTAINED_BLOB` with `GGML_OPENVINO_NPU_SHARED_BANK`, which embeds the full weights in every blob, it needs no OpenVINO patch.
 
 ```sh
 # export (first run)
-GGML_OPENVINO_DEVICE=NPU GGML_OPENVINO_NPU_WEIGHTLESS_BANK=1 \
-GGML_OPENVINO_COMPILED_MODEL_CACHE_DIR=/path/to/npu-cache ./build/ReleaseOV/bin/llama-cli -m model.gguf
+GGML_OPENVINO_DEVICE=NPU GGML_OPENVINO_KV_SLICE=0 GGML_OPENVINO_NPU_WEIGHTLESS_BANK=1 GGML_OPENVINO_COMPILED_MODEL_CACHE_DIR=/path/to/npu-cache ./build/ReleaseOV/bin/llama-bench -m model.gguf -p 512 -n 0 -pg 512,128
 # import (later runs); SELF_CONTAINED_MMAP also skips the private model buffer and fails if the cache is missing
-GGML_OPENVINO_DEVICE=NPU GGML_OPENVINO_NPU_WEIGHTLESS_BANK=1 GGML_OPENVINO_SELF_CONTAINED_MMAP=1 \
-GGML_OPENVINO_COMPILED_MODEL_CACHE_DIR=/path/to/npu-cache ./build/ReleaseOV/bin/llama-cli -m model.gguf
+GGML_OPENVINO_DEVICE=NPU GGML_OPENVINO_KV_SLICE=0 GGML_OPENVINO_NPU_WEIGHTLESS_BANK=1 GGML_OPENVINO_SELF_CONTAINED_MMAP=1 GGML_OPENVINO_COMPILED_MODEL_CACHE_DIR=/path/to/npu-cache ./build/ReleaseOV/bin/llama-bench -m model.gguf -p 512 -n 0 -pg 512,128
 ```
 
-Keep all other settings identical between the export and import runs; they are part of the cache key. If either blob or the weights file is missing or incomplete, the pair is recompiled and all three files are rewritten.
+Keep all other settings identical between the export and import runs; they are part of the cache key. `GGML_OPENVINO_KV_SLICE=0` is recommended: with slicing on, every new prefill attention size compiles a new pair. If a pair's blobs, reference or weights file are missing or incomplete, the pair is recompiled; an identical weights file is reused rather than rewritten.
