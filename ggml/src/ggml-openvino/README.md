@@ -91,3 +91,7 @@ The generic recurrent-cache translation invalidates blobs made with the former s
 # KV-only prefill
 
 On the static path (NPU, or any device with `GGML_OPENVINO_FORCE_STATIC=1`), models whose tail layers read an earlier layer's KV get a KV-only prefill by default; `GGML_OPENVINO_KV_ONLY_PREFILL=0` turns it off (the earlier name `GGML_OPENVINO_NPU_KV_ONLY_PREFILL` is still accepted). It compiles the static prefill graph with only the KV-cache writes as outputs (`openvino/pass/keep_cache_results.cpp`). Everything that only feeds the logits is dropped from it: for models whose tail layers read an earlier layer's KV (Gemma 3n/4 E-series) that is every KV-shared layer, plus the LM head. When the batch needs logits, the decode graph is then run once on the output token; it rewrites that token's KV rows and computes the dropped layers against the complete cache. It is used only when the graph has KV-shared attention layers and at most one output token per batch.
+
+# NPU host gather
+
+`GGML_OPENVINO_NPU_HOST_GATHER=1` (NPU, opt-in) gathers the rows of large host-resident embedding tables (at least 64 MiB, raw GGUF data) on the host. The static graph gets the gathered rows through an `ggml_host_rows_<node>` input instead of an OpenVINO Gather over the table. NPUW otherwise lifts the table to a function input, and gathering from an input that large costs about as much as streaming the whole table every call (21.6 ms of Gemma 4 E2B decode). A table used only for such lookups (the Gemma 3n/4 per-layer embedding table) is not converted or bound to the NPU at all.
