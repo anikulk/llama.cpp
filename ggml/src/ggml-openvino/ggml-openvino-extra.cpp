@@ -127,6 +127,7 @@ void ggml_openvino_device_config::init() {
         // Integer values (use ggml_openvino_getenv_int)
         "GGML_OPENVINO_PREFILL_CHUNK_SIZE",
         "GGML_OPENVINO_LAZY_HOST_THRESHOLD_MB",
+        "GGML_OPENVINO_NPU_BLOB_PREBUILD",
         "GGML_OPENVINO_NPU_DECODE_PREBUILD",
         "GGML_OPENVINO_NPU_KV_ON_DEMAND",
         // Boolean toggles (treated as int flags via ggml_openvino_getenv_int)
@@ -392,7 +393,11 @@ int ggml_openvino_npu_decode_bucket() {
     if (!ggml_openvino_is_npu()) {
         return 0;
     }
-    return ggml_openvino_getenv_int("GGML_OPENVINO_NPU_DECODE_PREBUILD") != 0 ? 1024 : 0;
+    // GGML_OPENVINO_NPU_DECODE_PREBUILD is the earlier name, from when only decode windows were prebuilt.
+    const char * prebuild = ggml_openvino_getenv_str("GGML_OPENVINO_NPU_BLOB_PREBUILD") != nullptr ?
+                                "GGML_OPENVINO_NPU_BLOB_PREBUILD" :
+                                "GGML_OPENVINO_NPU_DECODE_PREBUILD";
+    return ggml_openvino_getenv_int(prebuild) != 0 ? 1024 : 0;
 }
 
 bool ggml_openvino_npu_kv_on_demand_enabled() {
