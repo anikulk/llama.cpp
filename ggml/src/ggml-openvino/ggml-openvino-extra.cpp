@@ -127,8 +127,6 @@ void ggml_openvino_device_config::init() {
         // Integer values (use ggml_openvino_getenv_int)
         "GGML_OPENVINO_PREFILL_CHUNK_SIZE",
         "GGML_OPENVINO_LAZY_HOST_THRESHOLD_MB",
-        "GGML_OPENVINO_NPU_BLOB_PREBUILD",
-        "GGML_OPENVINO_NPU_DECODE_PREBUILD",
         "GGML_OPENVINO_NPU_KV_ON_DEMAND",
         // Boolean toggles (treated as int flags via ggml_openvino_getenv_int)
         "GGML_OPENVINO_STATEFUL_EXECUTION",
@@ -173,6 +171,7 @@ void ggml_openvino_device_config::init() {
         "GGML_OPENVINO_GDN_NATIVE_STATE",
         "GGML_OPENVINO_NPU_L0_HOST_TENSORS",
         "GGML_OPENVINO_KV_SLICE",
+        "GGML_OPENVINO_KV_SLICE_BUCKET",
         "GGML_OPENVINO_NPU_HFA_PREFILL",
         "GGML_OPENVINO_NPU_DECODE_UNFOLD",
         "GGML_OPENVINO_NPU_PARALLEL_COMPILE",
@@ -369,6 +368,18 @@ bool ggml_openvino_kv_slice_enabled() {
     return ggml_openvino_getenv_int("GGML_OPENVINO_KV_SLICE", 1) != 0;
 }
 
+int ggml_openvino_kv_slice_static_len(int n_kv, int ctx) {
+    const int base = ggml_openvino_getenv_int("GGML_OPENVINO_KV_SLICE_BUCKET", 0);
+    if (base <= 0 || n_kv <= 0 || ctx <= 0) {
+        return n_kv;
+    }
+    int64_t len = base;
+    while (len < n_kv) {
+        len *= 2;
+    }
+    return static_cast<int>(std::min<int64_t>(len, ctx));
+}
+
 bool ggml_openvino_npu_fast_mask_enabled() {
     return ggml_openvino_getenv_int("GGML_OPENVINO_NPU_FAST_MASK", 1) != 0;
 }
@@ -393,20 +404,20 @@ int ggml_openvino_npu_decode_bucket() {
     if (!ggml_openvino_is_npu()) {
         return 0;
     }
-    // GGML_OPENVINO_NPU_DECODE_PREBUILD is the earlier name, from when only decode windows were prebuilt.
-    const char * prebuild = ggml_openvino_getenv_str("GGML_OPENVINO_NPU_BLOB_PREBUILD") != nullptr ?
-                                "GGML_OPENVINO_NPU_BLOB_PREBUILD" :
-                                "GGML_OPENVINO_NPU_DECODE_PREBUILD";
-    return ggml_openvino_getenv_int(prebuild) != 0 ? 1024 : 0;
+    return std::max(0, ggml_openvino_getenv_int("GGML_OPENVINO_KV_SLICE_BUCKET"));
 }
+
 
 bool ggml_openvino_npu_kv_on_demand_enabled() {
     return ggml_openvino_is_npu() && ggml_openvino_getenv_int("GGML_OPENVINO_NPU_KV_ON_DEMAND") != 0;
 }
 
 bool ggml_openvino_npu_kv_head_major_enabled() {
-    return ggml_openvino_npu_kv_on_demand_enabled() && ggml_openvino_npu_decode_bucket() > 0 &&
-           ggml_openvino_kv_slice_enabled();
+    return ggml_openvino_npu_kv_on_demand_enabled() && ggml_openvino_npu_decode_bucket() > 0;
+}
+
+bool ggml_openvino_static_kv_slice_enabled() {
+    return ggml_openvino_getenv_int("GGML_OPENVINO_KV_SLICE_BUCKET") > 0;
 }
 
 bool ggml_openvino_npu_host_gather_enabled() {

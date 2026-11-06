@@ -1117,9 +1117,12 @@ std::pair<ModelParams, ComputeParams> GgmlOvDecoder::compute_llm_params(ggml_cgr
                 compute_params.mask_name = mask_name;
             }
             if (is_static) {
-                const bool slice_prefill = ggml_openvino_kv_slice_enabled() && compute_params.input_len > 1;
+                const bool slice_prefill = ggml_openvino_static_kv_slice_enabled() && compute_params.input_len > 1;
                 if (!slice_prefill) {
                     compute_params.attention_size = model_params.ctx_per_seq;
+                } else if (!layer_is_swa) {
+                    compute_params.attention_size =
+                        ggml_openvino_kv_slice_static_len(mask->ne[0], model_params.ctx_per_seq);
                 }
                 compute_params.attention_size_swa = model_params.ctx_per_seq_swa;
                 compute_params.token_len_per_seq = 1;
@@ -1140,8 +1143,11 @@ std::pair<ModelParams, ComputeParams> GgmlOvDecoder::compute_llm_params(ggml_cgr
             node->src[0]->src[0]->op == GGML_OP_VIEW) {
             compute_params.attention_size = node->ne[0];
             compute_params.mask_name.clear();
-            if (is_static && !(ggml_openvino_kv_slice_enabled() && compute_params.input_len > 1)) {
+            if (is_static && !(ggml_openvino_static_kv_slice_enabled() && compute_params.input_len > 1)) {
                 compute_params.attention_size = model_params.ctx_per_seq;
+            } else if (is_static) {
+                compute_params.attention_size =
+                    ggml_openvino_kv_slice_static_len(node->ne[0], model_params.ctx_per_seq);
             }
         }
         if (node->op == GGML_OP_ROPE) {
@@ -1322,7 +1328,7 @@ ov::PartialShape GgmlOvDecoder::get_graph_input_shape(const ggml_tensor * op,
             const bool swa_mask = is_swa_mask(input);
             int attention_size = swa_mask ? m_model_params.ctx_per_seq_swa * m_model_params.n_seq : m_model_params.ctx;
             const bool kv_window =
-                m_is_prefill ? ggml_openvino_kv_slice_enabled() : ggml_openvino_npu_decode_bucket() > 0;
+                m_is_prefill ? ggml_openvino_static_kv_slice_enabled() : ggml_openvino_npu_decode_bucket() > 0;
             if (kv_window) {
                 attention_size = swa_mask ? m_compute_params.attention_size_swa : m_compute_params.attention_size;
             }
@@ -1349,7 +1355,7 @@ ov::PartialShape GgmlOvDecoder::get_graph_input_shape(const ggml_tensor * op,
         if (!m_is_static && !is_flat_kv) {
             // do not fix ctx size to make llama-bench work across test params
             input_shape[2] = -1;
-        } else if (m_is_prefill ? ggml_openvino_kv_slice_enabled() :
+        } else if (m_is_prefill ? (m_is_static ? ggml_openvino_static_kv_slice_enabled() : ggml_openvino_kv_slice_enabled()) :
                                   m_is_static && ggml_openvino_npu_decode_bucket() > 0) {
             const auto layer = extract_layer_from_name(name);
             if (layer.has_value() && !is_swa_layer(*layer) && m_compute_params.attention_size > 0 &&

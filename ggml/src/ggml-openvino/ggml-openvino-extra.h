@@ -117,13 +117,21 @@ bool ggml_openvino_release_weights_enabled();
 // Check if running on NPU
 bool ggml_openvino_is_npu();
 
-// KV-cache slicing: bind the KV cache, and size the KQ masks, at the attended length instead of the full context.
-// One mechanism, two modes:
-//   dynamic graphs (CPU/GPU): the KV input is a view over the cache; the graph is not recompiled.
-//   static graphs (NPU, or any device with GGML_OPENVINO_FORCE_STATIC): the prefill graph is compiled at the aligned
-//   attended length and recompiled when it changes; decode keeps the full context.
-// On by default for all devices; GGML_OPENVINO_KV_SLICE=0 turns it off.
+// KV-cache slicing on dynamic graphs (CPU/GPU): bind the KV cache as a view of the attended rows and size the KQ
+// masks to them; the graph is not recompiled. On by default; GGML_OPENVINO_KV_SLICE=0 turns it off. Static graphs
+// do not follow this setting, see ggml_openvino_static_kv_slice_enabled().
 bool ggml_openvino_kv_slice_enabled();
+
+// KV buckets on static graphs (NPU, or any device with GGML_OPENVINO_FORCE_STATIC), GGML_OPENVINO_KV_SLICE_BUCKET=<base>:
+// the prefill graph is compiled for a KV bucket of base * 2^k rows instead of the full context, and on the NPU the
+// decode graph too (ggml_openvino_npu_decode_bucket()). Every bucket is a separate compiled model, so it is off by
+// default (one full-context prefill/decode pair). This is the only switch for KV buckets on static graphs.
+bool ggml_openvino_static_kv_slice_enabled();
+
+// Attended length a static prefill graph is compiled at for n_kv cache rows. GGML_OPENVINO_KV_SLICE_BUCKET=<base>
+// rounds it up to base * 2^k (capped at ctx) so a growing prompt or chat reuses one compiled graph per bucket
+// instead of recompiling at every 256-row step of n_kv; unset or 0 keeps n_kv.
+int ggml_openvino_kv_slice_static_len(int n_kv, int ctx);
 
 // On by default: back NPU buffers with Level Zero host memory; GGML_OPENVINO_NPU_L0_HOST_TENSORS=0 turns it off.
 bool ggml_openvino_npu_l0_host_tensors_enabled();
@@ -139,7 +147,7 @@ bool ggml_openvino_npu_parallel_compile_enabled();
 // Static path (NPU, or any device with GGML_OPENVINO_FORCE_STATIC): prefill only the KV-writing part of the model
 // and compute the logits with one decode step. Pays off for models whose tail layers share earlier layers' KV
 // (Gemma 3n/4 E-series), where it skips those layers for prompt tokens. On by default (it only applies to graphs
-// with KV-shared attention, at most one output token per batch, and no HFA prefill or decode KV windows);
+// with KV-shared attention, at most one output token per batch, and no HFA prefill or decode KV buckets);
 // GGML_OPENVINO_KV_ONLY_PREFILL=0 turns it off.
 bool ggml_openvino_kv_only_prefill_enabled();
 // Gather the rows of large embedding tables on the host and feed them to the static graph as an input, instead of
@@ -147,16 +155,15 @@ bool ggml_openvino_kv_only_prefill_enabled();
 // costs about as much as streaming the table).
 bool ggml_openvino_npu_host_gather_enabled();
 
-// GGML_OPENVINO_NPU_BLOB_PREBUILD=1: static NPU graphs attend a KV window of 1024*2^k rows (clamped to ctx)
-// instead of the whole ctx, with one decode model per window, all built/imported with the prefill/decode pair;
-// with head-major KV the prefill models of every window are also exported and preloaded.
-// Returns the window base (1024), 0 = off.
+// Static NPU decode attends a KV bucket of base * 2^k rows (clamped to ctx) instead of the whole ctx, one decode model
+// per bucket, with base = GGML_OPENVINO_KV_SLICE_BUCKET. Returns the base, 0 = off (decode attends the whole ctx).
 int ggml_openvino_npu_decode_bucket();
 
+
 // On-demand NPU KV cache (GGML_OPENVINO_NPU_KV_ON_DEMAND): the ggml KV buffer stays non-resident and the
-// NPU binds per-tensor L0 storage that grows (base*2^k rows, base = decode bucket or 1024) with the rows in use.
+// NPU binds per-tensor L0 storage that grows (base*2^k rows, base = KV_SLICE_BUCKET or 1024) with the rows in use.
 bool ggml_openvino_npu_kv_on_demand_enabled();
-// On-demand KV with BLOB_PREBUILD and KV_SLICE: K storage is [heads][rows][head_size] and V storage is
+// On-demand KV with KV buckets: K storage is [heads][rows][head_size] and V storage is
 // [heads][head_size][rows] (head-major with heads * head_size channels); every static graph binds the whole storage
 // as [1, heads, rows, head_size] / [1, heads, head_size, rows], and attention uses V^T.
 bool ggml_openvino_npu_kv_head_major_enabled();
