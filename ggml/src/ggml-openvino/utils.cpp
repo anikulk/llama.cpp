@@ -1854,7 +1854,12 @@ static ov::CompiledModel import_cached_blob(ov::Core & core,
     }
     std::ifstream blob_in(blob_path, std::ios::binary);
     const int64_t import_start_time = ggml_time_us();
-    ov::CompiledModel compiled = core.import_model(blob_in, device, import_config);
+    // On GPU the backend buffers live in the backend's remote context; a model imported on the plain device gets its
+    // own engine and cannot bind them ("engines mismatch"). None on NPU.
+    const auto remote_context = ggml_openvino_get_remote_context();
+    ov::CompiledModel compiled = remote_context.has_value() ?
+                                     core.import_model(blob_in, remote_context.value(), import_config) :
+                                     core.import_model(blob_in, device, import_config);
     if (ggml_openvino_getenv_int("GGML_OPENVINO_PROFILING")) {
         fprintf(stderr, "ggml-openvino: model cache IMPORT %s: %.3f ms\n", tag,
                 (ggml_time_us() - import_start_time) / 1000.0);
@@ -1898,6 +1903,13 @@ static void build_static_model(const static_build_args & a,
     auto & core = *a.core;
     const auto & device = a.device;
     const auto & model_cache_dir = a.model_cache_dir;
+    // On GPU the KV cache and the other backend buffers live in the backend's remote context; a model compiled or
+    // imported on the plain device gets its own engine and cannot bind them ("engines mismatch"). None on NPU.
+    const auto remote_context = ggml_openvino_get_remote_context();
+    auto import_static_model = [&](std::istream & blob_in, const ov::AnyMap & import_config) {
+        return remote_context.has_value() ? core.import_model(blob_in, remote_context.value(), import_config) :
+                                            core.import_model(blob_in, device, import_config);
+    };
     auto * cgraph = a.cgraph;
     std::string blob_path;
     std::string manifest_path;
@@ -1972,7 +1984,7 @@ static void build_static_model(const static_build_args & a,
                     import_config[ov::hint::model.name()] = std::shared_ptr<const ov::Model>(model);
                 }
                 const int64_t import_start_time = ggml_time_us();
-                compiled_model = core.import_model(blob_in, device, import_config);
+                compiled_model = import_static_model(blob_in, import_config);
                 const int64_t import_end_time = ggml_time_us();
                 if (ggml_openvino_getenv_int("GGML_OPENVINO_PROFILING")) {
                     fprintf(stderr, "ggml-openvino: model cache IMPORT %s: %.3f ms\n", tag,
@@ -1992,7 +2004,8 @@ static void build_static_model(const static_build_args & a,
         if (a.self_contained) {
             compile_config[ov::enable_weightless.name()] = a.weightless_bank;
         }
-        compiled_model = core.compile_model(model, device, compile_config);
+        compiled_model = remote_context.has_value() ? core.compile_model(model, remote_context.value(), compile_config) :
+                                                      core.compile_model(model, device, compile_config);
     }
     infer_request = std::make_shared<ov::InferRequest>(compiled_model.create_infer_request());
     local_compile_end_time = ggml_time_us();
